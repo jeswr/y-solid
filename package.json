@@ -1,0 +1,78 @@
+{
+  "name": "@jeswr/y-solid",
+  "version": "0.1.0",
+  "description": "A Yjs persistence provider that stores and loads a Yjs CRDT document in a Solid pod — bind any Y.Doc (TipTap / BlockNote / Monaco-collab / Excalidraw / …) to a pod LDP container via an injectable authenticated fetch. Append-only binary update-log persistence, fail-closed scope guard, live cross-client sync as a documented seam.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Jesse Wright",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jeswr/y-solid.git"
+  },
+  "homepage": "https://github.com/jeswr/y-solid#readme",
+  "bugs": {
+    "url": "https://github.com/jeswr/y-solid/issues"
+  },
+  "keywords": [
+    "yjs",
+    "y-solid",
+    "solid",
+    "crdt",
+    "collaborative",
+    "persistence",
+    "provider",
+    "rdf"
+  ],
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./scope": {
+      "types": "./dist/scope.d.ts",
+      "import": "./dist/scope.js"
+    },
+    "./store": {
+      "types": "./dist/store.d.ts",
+      "import": "./dist/store.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "lint": "biome check src",
+    "lint:fix": "biome check --write src",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "gate": "npm run lint && npm run typecheck && npm run test && npm run build && npm run check:dist && npm run check:lockfile-transport",
+    "check:dist": "node scripts/check-dist.mjs",
+    "check:lockfile-transport": "node scripts/check-lockfile-transport.mjs"
+  },
+  "dependencies": {
+    "@jeswr/fetch-rdf": "^0.1.0",
+    "@solid/object": "^0.6.0",
+    "n3": "^2.0.3"
+  },
+  "peerDependencies": {
+    "@rdfjs/types": "^2.0.1",
+    "yjs": "^13.6.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.0.0",
+    "@rdfjs/types": "^2.0.1",
+    "@types/n3": "^1.26.1",
+    "@types/node": "^20",
+    "typescript": "^5",
+    "vitest": "^4.1.8",
+    "yjs": "^13.6.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "$schema": "https://raw.githubusercontent.com/jeswr/full-solid-ecosystem/main/tracking/schema/suite.schema.json",
+  "id": "y-solid",
+  "kind": "package",
+  "name": "y-solid",
+  "repo": "https://github.com/jeswr/y-solid",
+  "category": "integration",
+  "maturity": "alpha",
+  "visibility": "public",
+  "stack": {
+    "lang": "TypeScript (ESM, NodeNext)",
+    "runtime": "Node >=20 / browser",
+    "crdt": "yjs ^13.6 (peerDependency)",
+    "rdf": "n3 ^2.x",
+    "fetch-rdf": "@jeswr/fetch-rdf ^0.1",
+    "solid-object": "@solid/object ^0.6",
+    "test": "vitest ^4.x",
+    "lint": "@biomejs/biome ^2.x",
+    "node": ">=20"
+  },
+  "dependsOn": [],
+  "integration": {
+    "ecosystem": "Yjs",
+    "note": "A Yjs persistence provider that stores/loads a Yjs CRDT document in a Solid pod. Yjs is the dominant CRDT powering collaborative editors (TipTap, BlockNote, Monaco-collab, Excalidraw, …); y-solid makes any Yjs app store its collaborative doc in the user's OWN pod. P1 = persistence: an append-only binary update-LOG (each Y update stored as application/octet-stream, merged on load) under a configured pod container, via an INJECTABLE authenticated fetch (the auth seam — never a concrete auth lib). Fail-closed scope guard (assertWithinBase) confines all writes to the container. Yjs is a peerDependency (not bundled). RDF discipline: the only RDF touched is the LDP container LISTING (read-only) via @jeswr/fetch-rdf parse + @solid/object ContainerDataset — never hand-built triples; the CRDT payload is binary, NOT RDF-encoded. Live cross-client sync (WebSocketChannel2023 / polling) is a DOCUMENTED seam, follow-up. GitHub-installable now (committed dist/, ignore-scripts=true); npm publish deferred, not a blocker."
+  }
+}
