@@ -31,7 +31,7 @@
  * See the README "Live sync" section. (Tracked as a follow-up.)
  */
 
-import { applyUpdate, type Doc, encodeStateAsUpdate, mergeUpdates } from "yjs";
+import { applyUpdate, Doc, encodeStateAsUpdate, mergeUpdates } from "yjs";
 import { SolidUpdateStore, type SolidUpdateStoreOptions } from "./store.js";
 
 /** Events emitted by {@link SolidPersistence}. */
@@ -143,31 +143,66 @@ export class SolidPersistence {
   }
 
   /**
-   * Apply a batch of (untrusted) binary updates to the doc as ONE transaction
-   * with this provider as the origin (echo-free). Each `applyUpdate` is wrapped
-   * individually so a single malformed/hostile update is skipped and reported on
-   * the `"error"` event rather than corrupting the transaction or throwing out of
-   * the load/sync path. Yjs's own CRDT decode is the only trust boundary; we do
-   * not attempt to validate the bytes ourselves.
+   * Apply a batch of (untrusted) binary updates to the live doc, echo-free.
+   *
+   * **Validate-on-scratch-first (load-bearing for data integrity).** Yjs
+   * transactions have NO rollback: a malformed update that throws AFTER partially
+   * integrating structs would leave the LIVE doc silently corrupted while we
+   * "skip" it. So every untrusted update is FIRST replayed against a throwaway
+   * `Y.Doc` — a malformed/forged update throws THERE (corrupting only the
+   * scratch, which is discarded) and is skipped + reported on `"error"`, the live
+   * doc untouched. Only updates that apply cleanly to the scratch are then
+   * applied to the live doc, batched into ONE transaction with this provider as
+   * the origin (so a good batch stays atomic-ish and echo-free — no N-transaction
+   * fan-out, no re-persist).
+   *
+   * A validated update should never throw on the live doc (decoding is
+   * state-independent); if one somehow does, that is a GENUINE integration error
+   * — surfaced on `"error"`, never swallowed as a mere "skipped corrupt update".
+   *
+   * @returns the count actually applied to the live doc.
    */
   private applyStored(updates: readonly Uint8Array[]): number {
     if (updates.length === 0) return 0;
-    const skipped: Error[] = [];
-    let applied = 0;
-    this.doc.transact(() => {
-      for (const update of updates) {
-        try {
-          applyUpdate(this.doc, update, this);
-          applied++;
-        } catch (cause) {
-          const error = cause instanceof Error ? cause : new Error(String(cause));
-          skipped.push(new Error(`[y-solid] skipped a corrupt update: ${error.message}`));
-        }
+    const errors: Error[] = [];
+    // 1. Validate each untrusted update against a fresh scratch doc.
+    const valid: Uint8Array[] = [];
+    for (const update of updates) {
+      const scratch = new Doc();
+      try {
+        applyUpdate(scratch, update);
+        valid.push(update);
+      } catch (cause) {
+        const error = cause instanceof Error ? cause : new Error(String(cause));
+        errors.push(new Error(`[y-solid] skipped a corrupt update: ${error.message}`));
+      } finally {
+        scratch.destroy();
       }
-    }, this);
+    }
+    // 2. Apply the validated updates to the LIVE doc as one echo-free transaction.
+    let applied = 0;
+    if (valid.length > 0) {
+      try {
+        this.doc.transact(() => {
+          for (const update of valid) {
+            applyUpdate(this.doc, update, this);
+            applied++;
+          }
+        }, this);
+      } catch (cause) {
+        // A scratch-validated update threw on the live doc — genuinely
+        // unexpected. Surface it (do NOT swallow it as "skipped").
+        const error = cause instanceof Error ? cause : new Error(String(cause));
+        errors.push(
+          new Error(
+            `[y-solid] failed to integrate a validated update into the doc: ${error.message}`,
+          ),
+        );
+      }
+    }
     // Emit AFTER the transaction commits so an error listener cannot reentrantly
     // mutate the doc mid-transaction.
-    for (const error of skipped) this.emit("error", error);
+    for (const error of errors) this.emit("error", error);
     return applied;
   }
 

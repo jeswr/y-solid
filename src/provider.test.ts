@@ -202,6 +202,64 @@ describe("SolidPersistence — corrupt-update resilience (untrusted pod bytes)",
   // Bytes that are NOT a valid Yjs update — Y.applyUpdate throws on them.
   const Corrupt = new Uint8Array([255, 255, 255, 255, 255, 255, 255, 255]);
 
+  /**
+   * A TRUNCATED valid update: applied directly to a LIVE doc it INTEGRATES the
+   * structs (mutating the doc) and THEN throws while reading the truncated tail.
+   * This is the dangerous "partial-integrate-then-throw" case Yjs cannot roll
+   * back — the reason we must validate on a scratch doc first.
+   */
+  function partialThenThrow(): Uint8Array {
+    const src = new Y.Doc();
+    src.getText("t").insert(0, "PARTIAL");
+    src.getMap("m").set("k", "vvvvv");
+    const good = Y.encodeStateAsUpdate(src);
+    return good.slice(0, good.length - 1);
+  }
+
+  it("a partial-integrate-then-throw update leaves the live doc BYTE-IDENTICAL; a valid update still applies", async () => {
+    // Sanity: prove the payload really mutates-then-throws on a raw live doc.
+    const probe = new Y.Doc();
+    const before = Y.encodeStateAsUpdate(probe);
+    expect(() => Y.applyUpdate(probe, partialThenThrow())).toThrow();
+    const afterRaw = Y.encodeStateAsUpdate(probe);
+    // The raw doc WAS mutated by the throwing update (no rollback) — the hazard.
+    expect(Array.from(afterRaw)).not.toEqual(Array.from(before));
+
+    const pod = makePod(CONTAINER);
+    const store = new SolidUpdateStore({ container: CONTAINER, fetch: pod.fetchImpl });
+    // A valid update that MUST still apply...
+    const seed = new Y.Doc();
+    seed.getText("t").insert(0, "ok");
+    await store.appendUpdate(Y.encodeStateAsUpdate(seed));
+    // ...and the hazardous partial-then-throw update alongside it.
+    pod.store.set(`${CONTAINER}000000000000000-partial`, {
+      body: partialThenThrow(),
+      contentType: "application/octet-stream",
+      etag: '"p"',
+    });
+
+    const doc = new Y.Doc();
+    // Snapshot the live doc state right before the provider's load applies anything.
+    const provider = new SolidPersistence({ doc, container: CONTAINER, fetch: pod.fetchImpl });
+    const onError = vi.fn();
+    provider.on("error", onError);
+    await provider.whenSynced;
+
+    // The valid update applied...
+    expect(doc.getText("t").toString()).toBe("ok");
+    // ...and the hazardous update left NO trace: the doc's state equals exactly a
+    // fresh doc with only the valid seed applied (byte-identical CRDT state).
+    const expected = new Y.Doc();
+    Y.applyUpdate(expected, Y.encodeStateAsUpdate(seed));
+    expect(Array.from(Y.encodeStateVector(doc))).toEqual(Array.from(Y.encodeStateVector(expected)));
+    // The map key from the throwing update must NOT be present.
+    expect(doc.getMap("m").get("k")).toBeUndefined();
+    // It was reported, not fatal.
+    expect(onError).toHaveBeenCalled();
+    expect((onError.mock.calls[0]?.[0] as Error).message).toMatch(/corrupt update/);
+    provider.destroy();
+  });
+
   it("skips a corrupt update on load, applies the valid ones, reports an error, and still syncs", async () => {
     const pod = makePod(CONTAINER);
     const store = new SolidUpdateStore({ container: CONTAINER, fetch: pod.fetchImpl });

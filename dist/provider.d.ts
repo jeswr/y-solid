@@ -29,7 +29,7 @@
  * any update resources appended since the last load and applies the new ones.
  * See the README "Live sync" section. (Tracked as a follow-up.)
  */
-import { type Doc } from "yjs";
+import { Doc } from "yjs";
 import { SolidUpdateStore } from "./store.js";
 /** Events emitted by {@link SolidPersistence}. */
 export interface SolidPersistenceEvents {
@@ -97,12 +97,24 @@ export declare class SolidPersistence {
      */
     private load;
     /**
-     * Apply a batch of (untrusted) binary updates to the doc as ONE transaction
-     * with this provider as the origin (echo-free). Each `applyUpdate` is wrapped
-     * individually so a single malformed/hostile update is skipped and reported on
-     * the `"error"` event rather than corrupting the transaction or throwing out of
-     * the load/sync path. Yjs's own CRDT decode is the only trust boundary; we do
-     * not attempt to validate the bytes ourselves.
+     * Apply a batch of (untrusted) binary updates to the live doc, echo-free.
+     *
+     * **Validate-on-scratch-first (load-bearing for data integrity).** Yjs
+     * transactions have NO rollback: a malformed update that throws AFTER partially
+     * integrating structs would leave the LIVE doc silently corrupted while we
+     * "skip" it. So every untrusted update is FIRST replayed against a throwaway
+     * `Y.Doc` — a malformed/forged update throws THERE (corrupting only the
+     * scratch, which is discarded) and is skipped + reported on `"error"`, the live
+     * doc untouched. Only updates that apply cleanly to the scratch are then
+     * applied to the live doc, batched into ONE transaction with this provider as
+     * the origin (so a good batch stays atomic-ish and echo-free — no N-transaction
+     * fan-out, no re-persist).
+     *
+     * A validated update should never throw on the live doc (decoding is
+     * state-independent); if one somehow does, that is a GENUINE integration error
+     * — surfaced on `"error"`, never swallowed as a mere "skipped corrupt update".
+     *
+     * @returns the count actually applied to the live doc.
      */
     private applyStored;
     /**
