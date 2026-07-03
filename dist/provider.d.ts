@@ -29,7 +29,7 @@
  * any update resources appended since the last load and applies the new ones.
  * See the README "Live sync" section. (Tracked as a follow-up.)
  */
-import { type Doc } from "yjs";
+import { Doc } from "yjs";
 import { SolidUpdateStore } from "./store.js";
 /** Events emitted by {@link SolidPersistence}. */
 export interface SolidPersistenceEvents {
@@ -96,6 +96,33 @@ export declare class SolidPersistence {
      * re-persist). Marks {@link synced} and fires `"synced"`.
      */
     private load;
+    /**
+     * Apply a batch of (untrusted) binary updates to the live doc, echo-free.
+     *
+     * **Validate-on-scratch-first (load-bearing for data integrity).** Yjs
+     * transactions have NO rollback: a malformed update that throws AFTER partially
+     * integrating structs would leave a doc silently corrupted, and the untrusted
+     * bytes are NEVER allowed to touch the LIVE doc directly. Two phases:
+     *
+     *   1. **Decode-validate** each untrusted update on a throwaway `Y.Doc` — a
+     *      malformed/forged update throws HERE (corrupting only the discarded
+     *      throwaway) and is skipped + reported on `"error"`.
+     *   2. **Seed-scratch-then-diff.** Seed a scratch doc from the CURRENT live
+     *      state, replay the decode-validated updates onto the scratch, then take a
+     *      Yjs-generated DIFF of the scratch against the live state vector and apply
+     *      THAT diff to the live doc in one echo-free transaction. A Yjs-generated
+     *      diff is well-formed by construction, so it cannot throw mid-integration —
+     *      the live doc is thus only ever mutated by clean, complete Yjs bytes, and
+     *      is NEVER left partially mutated by untrusted input.
+     *
+     * If any scratch step throws (not expected — decode already succeeded), we FAIL
+     * CLOSED: the diff is computed and applied only after the scratch work fully
+     * succeeds, so on any throw the live doc is untouched and the batch is reported
+     * on `"error"` with `applied === 0`.
+     *
+     * @returns the count folded into the live doc (0 if the batch failed closed).
+     */
+    private applyStored;
     /**
      * Pull updates appended to the pod SINCE the last load/sync and apply the new
      * ones — the manual hook a notifications channel or a poll loop calls to get

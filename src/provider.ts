@@ -31,8 +31,13 @@
  * See the README "Live sync" section. (Tracked as a follow-up.)
  */
 
-import { applyUpdate, type Doc, encodeStateAsUpdate, mergeUpdates } from "yjs";
+import { applyUpdate, Doc, encodeStateAsUpdate, encodeStateVector, mergeUpdates } from "yjs";
 import { SolidUpdateStore, type SolidUpdateStoreOptions } from "./store.js";
+
+/** Normalise an unknown throw value to an `Error`. */
+function toError(cause: unknown): Error {
+  return cause instanceof Error ? cause : new Error(String(cause));
+}
 
 /** Events emitted by {@link SolidPersistence}. */
 export interface SolidPersistenceEvents {
@@ -134,16 +139,89 @@ export class SolidPersistence {
   private async load(): Promise<void> {
     const stored = await this.store.loadUpdates();
     for (const { url } of stored) this.knownUrls.add(url);
-    if (stored.length > 0) {
-      // Fold the log into one update and apply it as a single transaction with
-      // this provider as the origin — efficient and echo-free.
-      const merged = mergeUpdates(stored.map((s) => s.update));
-      this.doc.transact(() => {
-        applyUpdate(this.doc, merged, this);
-      }, this);
-    }
+    // Apply each update RESILIENTLY: the bytes come from a pod that may be
+    // hostile or buggy, so one corrupt/forged update must be skipped + reported,
+    // never abort the whole load.
+    this.applyStored(stored.map((s) => s.update));
     this.synced = true;
     this.emit("synced");
+  }
+
+  /**
+   * Apply a batch of (untrusted) binary updates to the live doc, echo-free.
+   *
+   * **Validate-on-scratch-first (load-bearing for data integrity).** Yjs
+   * transactions have NO rollback: a malformed update that throws AFTER partially
+   * integrating structs would leave a doc silently corrupted, and the untrusted
+   * bytes are NEVER allowed to touch the LIVE doc directly. Two phases:
+   *
+   *   1. **Decode-validate** each untrusted update on a throwaway `Y.Doc` — a
+   *      malformed/forged update throws HERE (corrupting only the discarded
+   *      throwaway) and is skipped + reported on `"error"`.
+   *   2. **Seed-scratch-then-diff.** Seed a scratch doc from the CURRENT live
+   *      state, replay the decode-validated updates onto the scratch, then take a
+   *      Yjs-generated DIFF of the scratch against the live state vector and apply
+   *      THAT diff to the live doc in one echo-free transaction. A Yjs-generated
+   *      diff is well-formed by construction, so it cannot throw mid-integration —
+   *      the live doc is thus only ever mutated by clean, complete Yjs bytes, and
+   *      is NEVER left partially mutated by untrusted input.
+   *
+   * If any scratch step throws (not expected — decode already succeeded), we FAIL
+   * CLOSED: the diff is computed and applied only after the scratch work fully
+   * succeeds, so on any throw the live doc is untouched and the batch is reported
+   * on `"error"` with `applied === 0`.
+   *
+   * @returns the count folded into the live doc (0 if the batch failed closed).
+   */
+  private applyStored(updates: readonly Uint8Array[]): number {
+    if (updates.length === 0) return 0;
+    const errors: Error[] = [];
+    // Phase 1: decode-validate each untrusted update on a fresh throwaway doc.
+    const valid: Uint8Array[] = [];
+    for (const update of updates) {
+      const probe = new Doc();
+      try {
+        applyUpdate(probe, update);
+        valid.push(update);
+      } catch (cause) {
+        errors.push(new Error(`[y-solid] skipped a corrupt update: ${toError(cause).message}`));
+      } finally {
+        probe.destroy();
+      }
+    }
+    // Phase 2: fold the validated updates in via a Yjs-generated diff so the live
+    // doc is only ever mutated by well-formed, complete bytes (no partial-apply).
+    let applied = 0;
+    if (valid.length > 0) {
+      const scratch = new Doc();
+      try {
+        // Seed the scratch from the live state (so the diff is relative to it)...
+        applyUpdate(scratch, encodeStateAsUpdate(this.doc));
+        const liveVector = encodeStateVector(this.doc);
+        // ...replay the validated updates onto the scratch...
+        for (const update of valid) applyUpdate(scratch, update);
+        // ...and compute the net change as a Yjs-generated diff.
+        const diff = encodeStateAsUpdate(scratch, liveVector);
+        // Apply the clean diff to the live doc as one echo-free transaction.
+        this.doc.transact(() => {
+          applyUpdate(this.doc, diff, this);
+        }, this);
+        applied = valid.length;
+      } catch (cause) {
+        // A decode-validated update failed to integrate into the scratch — not
+        // expected. Fail closed: the live doc was NOT touched (the diff is applied
+        // only after the scratch work fully succeeds). Report, do not corrupt.
+        errors.push(
+          new Error(`[y-solid] failed to integrate validated updates: ${toError(cause).message}`),
+        );
+      } finally {
+        scratch.destroy();
+      }
+    }
+    // Emit AFTER the transaction commits so an error listener cannot reentrantly
+    // mutate the doc mid-transaction.
+    for (const error of errors) this.emit("error", error);
+    return applied;
   }
 
   /**
@@ -163,13 +241,10 @@ export class SolidPersistence {
       this.knownUrls.add(url);
       if (update) fresh.push(update);
     }
-    if (fresh.length > 0) {
-      const merged = mergeUpdates(fresh);
-      this.doc.transact(() => {
-        applyUpdate(this.doc, merged, this);
-      }, this);
-    }
-    return fresh.length;
+    // Resilient per-update application (a hostile pod could serve a corrupt
+    // update between loads). Returns the count actually applied (skipped-corrupt
+    // updates are consumed — their URLs are marked known above — but not counted).
+    return this.applyStored(fresh);
   }
 
   /** Enqueue a persist of `update`, serialised behind any in-flight write. */

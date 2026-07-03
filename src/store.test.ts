@@ -165,6 +165,143 @@ describe("compact — write-before-delete", () => {
   });
 });
 
+describe("redirect refusal — credentialed requests never follow a 3xx", () => {
+  const InScope = `${CONTAINER}update-1`;
+
+  it("refuses a 3xx on GET (list), PUT (append), GET (read), DELETE", async () => {
+    // A server that 3xx-redirects everything toward a foreign origin.
+    const redirectFetch: typeof globalThis.fetch = async () =>
+      new Response(null, { status: 302, headers: { location: "https://evil.example/" } });
+    const store = new SolidUpdateStore({ container: CONTAINER, fetch: redirectFetch });
+    await expect(store.listUpdateUrls()).rejects.toThrow(/redirected/);
+    await expect(store.appendUpdate(new Uint8Array([1]))).rejects.toThrow(/redirected/);
+    await expect(store.readUpdate(InScope)).rejects.toThrow(/redirected/);
+    await expect(store.deleteUpdate(InScope)).rejects.toThrow(/redirected/);
+  });
+
+  it("refuses a browser-style opaqueredirect (filtered response, status 0)", async () => {
+    const opaque = {
+      type: "opaqueredirect",
+      status: 0,
+      ok: false,
+      headers: new Headers(),
+    } as unknown as Response;
+    const opaqueFetch: typeof globalThis.fetch = async () => opaque;
+    const store = new SolidUpdateStore({ container: CONTAINER, fetch: opaqueFetch });
+    await expect(store.readUpdate(InScope)).rejects.toThrow(/redirected/);
+    await expect(store.listUpdateUrls()).rejects.toThrow(/redirected/);
+  });
+
+  it("passes redirect:'manual' on every request (so the fetch never follows)", async () => {
+    const modes: (string | undefined)[] = [];
+    const spyFetch: typeof globalThis.fetch = async (_input, init) => {
+      modes.push(init?.redirect);
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (method === "GET") {
+        return new Response(
+          `@prefix ldp: <http://www.w3.org/ns/ldp#> .\n<${CONTAINER}> a ldp:Container .`,
+          {
+            status: 200,
+            headers: { "content-type": "text/turtle" },
+          },
+        );
+      }
+      return new Response(null, { status: 201 });
+    };
+    const store = new SolidUpdateStore({ container: CONTAINER, fetch: spyFetch });
+    await store.listUpdateUrls();
+    await store.appendUpdate(new Uint8Array([1]));
+    await store.deleteUpdate(`${CONTAINER}x`);
+    expect(modes.every((m) => m === "manual")).toBe(true);
+  });
+});
+
+describe("size caps — hostile/unbounded bodies are refused", () => {
+  it("refuses an update whose declared content-length exceeds maxUpdateBytes", async () => {
+    const pod = makePod(CONTAINER);
+    const store = new SolidUpdateStore({
+      container: CONTAINER,
+      fetch: pod.fetchImpl,
+      maxUpdateBytes: 8,
+    });
+    const { url } = await store.appendUpdate(new Uint8Array(32));
+    await expect(store.readUpdate(url)).rejects.toThrow(/max size/);
+  });
+
+  it("refuses an update with NO content-length once the stream passes the cap", async () => {
+    // A body streamed with unknown length (no content-length): the cap must be
+    // enforced on the bytes actually pulled, not just the header.
+    const streamFetch: typeof globalThis.fetch = async () => {
+      const stream = new ReadableStream({
+        start(c) {
+          c.enqueue(new Uint8Array(20));
+          c.close();
+        },
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { "content-type": UPDATE_CONTENT_TYPE },
+      });
+    };
+    const store = new SolidUpdateStore({
+      container: CONTAINER,
+      fetch: streamFetch,
+      maxUpdateBytes: 8,
+    });
+    await expect(store.readUpdate(`${CONTAINER}u`)).rejects.toThrow(/max size/);
+  });
+
+  it("refuses a container listing that exceeds maxListingBytes", async () => {
+    const pod = makePod(CONTAINER);
+    const store = new SolidUpdateStore({
+      container: CONTAINER,
+      fetch: pod.fetchImpl,
+      maxListingBytes: 8,
+    });
+    // Even the empty-container listing Turtle is > 8 bytes.
+    await expect(store.listUpdateUrls()).rejects.toThrow(/max size/);
+  });
+
+  it("a bad cap value (0/NaN) falls back to the default, not an accidentally-disabled cap", async () => {
+    const pod = makePod(CONTAINER);
+    const store = new SolidUpdateStore({
+      container: CONTAINER,
+      fetch: pod.fetchImpl,
+      maxUpdateBytes: 0,
+      maxListingBytes: Number.NaN,
+    });
+    const { url } = await store.appendUpdate(new Uint8Array([1, 2, 3]));
+    // The default (64 MiB) is used → a normal small read succeeds.
+    expect(await store.readUpdate(url)).not.toBeNull();
+    expect(await store.listUpdateUrls()).toHaveLength(1);
+  });
+});
+
+describe("hostile container listing — fail closed per entry", () => {
+  it("skips foreign-origin, sub-container, and non-http contains entries; keeps valid ones", async () => {
+    const hostileFetch: typeof globalThis.fetch = async (input, init) => {
+      const url = typeof input === "string" ? input : (input as URL | Request).toString();
+      const method = (init?.method ?? "GET").toUpperCase();
+      if (method === "GET" && url === CONTAINER) {
+        const body = `@prefix ldp: <http://www.w3.org/ns/ldp#> .
+<${CONTAINER}> a ldp:Container ;
+  ldp:contains <${CONTAINER}good>,
+    <https://evil.example/steal>,
+    <http://alice.pod/notes/my-doc/downgrade>,
+    <${CONTAINER}sub/>,
+    <mailto:x>,
+    <${CONTAINER}../escape> .`;
+        return new Response(body, { status: 200, headers: { "content-type": "text/turtle" } });
+      }
+      return new Response(null, { status: 404 });
+    };
+    const store = new SolidUpdateStore({ container: CONTAINER, fetch: hostileFetch });
+    const listed = await store.listUpdateUrls();
+    // Only the in-scope, non-container, http(s), same-origin member survives.
+    expect(listed).toEqual([`${CONTAINER}good`]);
+  });
+});
+
 describe("missing container", () => {
   it("listUpdateUrls returns [] when the container 404s", async () => {
     // A fetch that 404s everything (no container present at all).
