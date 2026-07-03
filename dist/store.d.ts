@@ -45,6 +45,22 @@
  */
 /** The media type every update resource is stored with. */
 export declare const UPDATE_CONTENT_TYPE = "application/octet-stream";
+/**
+ * Default fail-closed cap on the bytes read for a SINGLE update resource. A
+ * hostile or buggy server could serve an unbounded (or chunked, content-length-
+ * less) body on a member URL; reading it into memory unbounded is a DoS. 64 MiB
+ * comfortably exceeds any realistic single Yjs update while bounding the read.
+ * Override per store via `maxUpdateBytes`.
+ */
+export declare const DEFAULT_MAX_UPDATE_BYTES: number;
+/**
+ * Default fail-closed cap on the bytes read for the container LISTING. A hostile
+ * server could return an enormous Turtle/JSON-LD listing (millions of
+ * `ldp:contains` triples) to exhaust memory before we even iterate members;
+ * capping the read bounds both the parse cost and the member count. 16 MiB.
+ * Override per store via `maxListingBytes`.
+ */
+export declare const DEFAULT_MAX_LISTING_BYTES: number;
 /** A single binary update read from (or to be written to) the log. */
 export interface StoredUpdate {
     /** Absolute URL of the update resource. */
@@ -58,6 +74,17 @@ export interface SolidUpdateStoreOptions {
     container: string;
     /** The (authenticated) fetch the store issues every request with. */
     fetch: typeof globalThis.fetch;
+    /**
+     * Fail-closed cap (bytes) on a single update resource read. Defaults to
+     * {@link DEFAULT_MAX_UPDATE_BYTES}. A resource whose body exceeds this is
+     * refused rather than buffered unbounded.
+     */
+    maxUpdateBytes?: number;
+    /**
+     * Fail-closed cap (bytes) on the container listing read. Defaults to
+     * {@link DEFAULT_MAX_LISTING_BYTES}.
+     */
+    maxListingBytes?: number;
 }
 /**
  * The persistence store for a single Yjs doc's update log under one container.
@@ -70,6 +97,8 @@ export declare class SolidUpdateStore {
     /** The normalised container URL (one trailing slash). */
     readonly container: string;
     private readonly fetch;
+    private readonly maxUpdateBytes;
+    private readonly maxListingBytes;
     constructor(options: SolidUpdateStoreOptions);
     /**
      * Append a binary update to the log: PUT it to a freshly-minted

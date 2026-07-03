@@ -198,6 +198,72 @@ describe("SolidPersistence — compaction", () => {
   });
 });
 
+describe("SolidPersistence — corrupt-update resilience (untrusted pod bytes)", () => {
+  // Bytes that are NOT a valid Yjs update — Y.applyUpdate throws on them.
+  const Corrupt = new Uint8Array([255, 255, 255, 255, 255, 255, 255, 255]);
+
+  it("skips a corrupt update on load, applies the valid ones, reports an error, and still syncs", async () => {
+    const pod = makePod(CONTAINER);
+    const store = new SolidUpdateStore({ container: CONTAINER, fetch: pod.fetchImpl });
+
+    // A valid seed update...
+    const seed = new Y.Doc();
+    seed.getText("t").insert(0, "ok");
+    await store.appendUpdate(Y.encodeStateAsUpdate(seed));
+    // ...plus a corrupt resource injected directly into the backing pod.
+    pod.store.set(`${CONTAINER}000000000000000-corrupt`, {
+      body: Corrupt,
+      contentType: "application/octet-stream",
+      etag: '"c"',
+    });
+
+    const doc = new Y.Doc();
+    const provider = new SolidPersistence({ doc, container: CONTAINER, fetch: pod.fetchImpl });
+    const onError = vi.fn();
+    provider.on("error", onError);
+
+    // The load RESOLVES (does not reject) despite the corrupt member.
+    await provider.whenSynced;
+    expect(provider.synced).toBe(true);
+    // The valid update was applied.
+    expect(doc.getText("t").toString()).toBe("ok");
+    // The corrupt one was reported, not fatal.
+    expect(onError).toHaveBeenCalled();
+    expect(onError.mock.calls[0]?.[0]).toBeInstanceOf(Error);
+    expect((onError.mock.calls[0]?.[0] as Error).message).toMatch(/corrupt update/);
+    provider.destroy();
+  });
+
+  it("sync() skips a corrupt update appended after load and returns the applied count", async () => {
+    const pod = makePod(CONTAINER);
+    const doc = new Y.Doc();
+    const provider = new SolidPersistence({ doc, container: CONTAINER, fetch: pod.fetchImpl });
+    await provider.whenSynced;
+    const onError = vi.fn();
+    provider.on("error", onError);
+
+    // Append one corrupt + one valid update to the pod after the initial load.
+    const store = new SolidUpdateStore({ container: CONTAINER, fetch: pod.fetchImpl });
+    pod.store.set(`${CONTAINER}000000000000000-corrupt2`, {
+      body: Corrupt,
+      contentType: "application/octet-stream",
+      etag: '"c2"',
+    });
+    const good = new Y.Doc();
+    good.getText("t").insert(0, "live");
+    await store.appendUpdate(Y.encodeStateAsUpdate(good));
+
+    // Two fresh URLs seen, one applied (the corrupt one is consumed but skipped).
+    const applied = await provider.sync();
+    expect(applied).toBe(1);
+    expect(doc.getText("t").toString()).toBe("live");
+    expect(onError).toHaveBeenCalled();
+    // The corrupt URL is now known — a second sync re-does nothing.
+    expect(await provider.sync()).toBe(0);
+    provider.destroy();
+  });
+});
+
 describe("SolidPersistence — error handling + lifecycle", () => {
   it("emits an 'error' event when a background persist fails (does not throw out-of-band)", async () => {
     // A pod whose container GET works but whose PUT always 500s.

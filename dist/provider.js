@@ -101,16 +101,43 @@ export class SolidPersistence {
         const stored = await this.store.loadUpdates();
         for (const { url } of stored)
             this.knownUrls.add(url);
-        if (stored.length > 0) {
-            // Fold the log into one update and apply it as a single transaction with
-            // this provider as the origin — efficient and echo-free.
-            const merged = mergeUpdates(stored.map((s) => s.update));
-            this.doc.transact(() => {
-                applyUpdate(this.doc, merged, this);
-            }, this);
-        }
+        // Apply each update RESILIENTLY: the bytes come from a pod that may be
+        // hostile or buggy, so one corrupt/forged update must be skipped + reported,
+        // never abort the whole load.
+        this.applyStored(stored.map((s) => s.update));
         this.synced = true;
         this.emit("synced");
+    }
+    /**
+     * Apply a batch of (untrusted) binary updates to the doc as ONE transaction
+     * with this provider as the origin (echo-free). Each `applyUpdate` is wrapped
+     * individually so a single malformed/hostile update is skipped and reported on
+     * the `"error"` event rather than corrupting the transaction or throwing out of
+     * the load/sync path. Yjs's own CRDT decode is the only trust boundary; we do
+     * not attempt to validate the bytes ourselves.
+     */
+    applyStored(updates) {
+        if (updates.length === 0)
+            return 0;
+        const skipped = [];
+        let applied = 0;
+        this.doc.transact(() => {
+            for (const update of updates) {
+                try {
+                    applyUpdate(this.doc, update, this);
+                    applied++;
+                }
+                catch (cause) {
+                    const error = cause instanceof Error ? cause : new Error(String(cause));
+                    skipped.push(new Error(`[y-solid] skipped a corrupt update: ${error.message}`));
+                }
+            }
+        }, this);
+        // Emit AFTER the transaction commits so an error listener cannot reentrantly
+        // mutate the doc mid-transaction.
+        for (const error of skipped)
+            this.emit("error", error);
+        return applied;
     }
     /**
      * Pull updates appended to the pod SINCE the last load/sync and apply the new
@@ -132,13 +159,10 @@ export class SolidPersistence {
             if (update)
                 fresh.push(update);
         }
-        if (fresh.length > 0) {
-            const merged = mergeUpdates(fresh);
-            this.doc.transact(() => {
-                applyUpdate(this.doc, merged, this);
-            }, this);
-        }
-        return fresh.length;
+        // Resilient per-update application (a hostile pod could serve a corrupt
+        // update between loads). Returns the count actually applied (skipped-corrupt
+        // updates are consumed — their URLs are marked known above — but not counted).
+        return this.applyStored(fresh);
     }
     /** Enqueue a persist of `update`, serialised behind any in-flight write. */
     enqueuePersist(update) {

@@ -53,6 +53,24 @@ import { assertWithinBase, isContainerUrl, normalizeContainer } from "./scope.js
 /** The media type every update resource is stored with. */
 export const UPDATE_CONTENT_TYPE = "application/octet-stream";
 
+/**
+ * Default fail-closed cap on the bytes read for a SINGLE update resource. A
+ * hostile or buggy server could serve an unbounded (or chunked, content-length-
+ * less) body on a member URL; reading it into memory unbounded is a DoS. 64 MiB
+ * comfortably exceeds any realistic single Yjs update while bounding the read.
+ * Override per store via `maxUpdateBytes`.
+ */
+export const DEFAULT_MAX_UPDATE_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Default fail-closed cap on the bytes read for the container LISTING. A hostile
+ * server could return an enormous Turtle/JSON-LD listing (millions of
+ * `ldp:contains` triples) to exhaust memory before we even iterate members;
+ * capping the read bounds both the parse cost and the member count. 16 MiB.
+ * Override per store via `maxListingBytes`.
+ */
+export const DEFAULT_MAX_LISTING_BYTES = 16 * 1024 * 1024;
+
 /** A single binary update read from (or to be written to) the log. */
 export interface StoredUpdate {
   /** Absolute URL of the update resource. */
@@ -67,6 +85,86 @@ export interface SolidUpdateStoreOptions {
   container: string;
   /** The (authenticated) fetch the store issues every request with. */
   fetch: typeof globalThis.fetch;
+  /**
+   * Fail-closed cap (bytes) on a single update resource read. Defaults to
+   * {@link DEFAULT_MAX_UPDATE_BYTES}. A resource whose body exceeds this is
+   * refused rather than buffered unbounded.
+   */
+  maxUpdateBytes?: number;
+  /**
+   * Fail-closed cap (bytes) on the container listing read. Defaults to
+   * {@link DEFAULT_MAX_LISTING_BYTES}.
+   */
+  maxListingBytes?: number;
+}
+
+/**
+ * Fail-closed refusal to FOLLOW a redirect on a credentialed request. The store
+ * issues every request with the caller's AUTHENTICATED fetch, so a 3xx to a
+ * foreign origin would replay the caller's credentials (bearer / DPoP-bound
+ * token) off-container. We set `redirect: "manual"` on every request and treat
+ * ANY redirect as a hard error:
+ *   - browsers surface a filtered `opaqueredirect` response (`type` set,
+ *     `status === 0`);
+ *   - Node/undici surfaces the raw 3xx response (unfollowed).
+ * Either way we refuse. (Suite recurring finding class: redirect-refusal SSRF.)
+ */
+function assertNotRedirected(res: Response, url: string): void {
+  if (res.type === "opaqueredirect" || (res.status >= 300 && res.status < 400)) {
+    throw new Error(
+      `[y-solid] request to ${url} was redirected (status ${res.status}); refused for credential safety`,
+    );
+  }
+}
+
+/**
+ * Read a response body into bytes with a fail-closed size cap, streaming so an
+ * unbounded (content-length-less) body cannot be buffered whole before the cap
+ * is hit. Honours a declared `content-length` for a fast-fail, then enforces the
+ * cap on the actual bytes streamed (a lying/absent content-length can't bypass
+ * it). Throws if the body exceeds `cap`.
+ */
+async function readBodyCapped(res: Response, cap: number, url: string): Promise<Uint8Array> {
+  const declared = Number(res.headers.get("content-length"));
+  if (Number.isFinite(declared) && declared > cap) {
+    throw new Error(
+      `[y-solid] resource ${url} exceeds max size (content-length ${declared} > ${cap} bytes); refused`,
+    );
+  }
+  const body = res.body;
+  if (!body) {
+    // No stream available (e.g. an empty body): fall back to a buffered read,
+    // then enforce the cap on the materialised bytes.
+    const buf = new Uint8Array(await res.arrayBuffer());
+    if (buf.byteLength > cap) {
+      throw new Error(
+        `[y-solid] resource ${url} exceeds max size (${buf.byteLength} > ${cap} bytes); refused`,
+      );
+    }
+    return buf;
+  }
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (!value) continue;
+    total += value.byteLength;
+    if (total > cap) {
+      // Stop pulling and refuse — never accumulate past the cap.
+      await reader.cancel().catch(() => {});
+      throw new Error(`[y-solid] resource ${url} exceeds max size (> ${cap} bytes); refused`);
+    }
+    chunks.push(value);
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
 }
 
 /**
@@ -95,11 +193,15 @@ export class SolidUpdateStore {
   /** The normalised container URL (one trailing slash). */
   readonly container: string;
   private readonly fetch: typeof globalThis.fetch;
+  private readonly maxUpdateBytes: number;
+  private readonly maxListingBytes: number;
 
   constructor(options: SolidUpdateStoreOptions) {
     // normalizeContainer throws on a non-http(s) / non-absolute container.
     this.container = normalizeContainer(options.container);
     this.fetch = options.fetch;
+    this.maxUpdateBytes = clampPositive(options.maxUpdateBytes, DEFAULT_MAX_UPDATE_BYTES);
+    this.maxListingBytes = clampPositive(options.maxListingBytes, DEFAULT_MAX_LISTING_BYTES);
   }
 
   /**
@@ -116,6 +218,7 @@ export class SolidUpdateStore {
     assertWithinBase(this.container, url);
     const res = await this.fetch(url, {
       method: "PUT",
+      redirect: "manual",
       headers: {
         "content-type": UPDATE_CONTENT_TYPE,
         "if-none-match": "*",
@@ -125,6 +228,7 @@ export class SolidUpdateStore {
       // buffer Yjs may reuse for the next event.
       body: toBody(update),
     });
+    assertNotRedirected(res, url);
     if (!res.ok) {
       throw new Error(`[y-solid] appendUpdate ${url} failed: ${res.status} ${res.statusText}`);
     }
@@ -145,15 +249,20 @@ export class SolidUpdateStore {
   async listUpdateUrls(): Promise<string[]> {
     const res = await this.fetch(this.container, {
       method: "GET",
+      redirect: "manual",
       headers: { accept: "text/turtle, application/ld+json;q=0.9" },
     });
+    assertNotRedirected(res, this.container);
     if (res.status === 404 || res.status === 410) {
       return [];
     }
     if (!res.ok) {
       throw new Error(`[y-solid] list ${this.container} failed: ${res.status} ${res.statusText}`);
     }
-    const body = await res.text();
+    // Size-cap the listing read: a hostile server could return an unbounded
+    // listing to exhaust memory before we iterate members.
+    const bytes = await readBodyCapped(res, this.maxListingBytes, this.container);
+    const body = new TextDecoder().decode(bytes);
     // parseRdf resolves relative IRIs against the container URL (baseIRI), so
     // ldp:contains object IRIs come back absolute.
     const dataset = await parseRdf(body, res.headers.get("content-type"), {
@@ -170,23 +279,32 @@ export class SolidUpdateStore {
     // or buggy server might list — `…/doc/?x=1`, `…/doc/#frag` — is skipped too.
     const base = new URL(this.container);
     for (const resource of container.contains) {
-      // resource.id may be relative; resolve against the container URL to be safe.
-      const absolute = new URL(resource.id, this.container).toString();
-      const member = new URL(absolute);
-      if (member.origin === base.origin && member.pathname === base.pathname) {
-        continue;
-      }
-      // An update resource is never a (sub-)container.
-      if (isContainerUrl(absolute)) {
-        continue;
-      }
-      // Defence in depth: never surface a member that escapes the container.
+      // Every per-entry step is wrapped: a hostile/buggy server can list a
+      // non-URL, an unparseable IRI, a foreign-origin, or an escaping member —
+      // any of which must SKIP that one entry, never throw out of the listing
+      // (fail closed per-entry).
       try {
+        // resource.id may be relative or malformed; resolving against a valid
+        // base rarely throws, but a pathological id can — hence the wrap.
+        const absolute = new URL(resource.id, this.container).toString();
+        const member = new URL(absolute);
+        // The container lists ITSELF as a member; skip it (origin+pathname only,
+        // ignoring any query/fragment a hostile server might append).
+        if (member.origin === base.origin && member.pathname === base.pathname) {
+          continue;
+        }
+        // An update resource is never a (sub-)container.
+        if (isContainerUrl(absolute)) {
+          continue;
+        }
+        // Defence in depth: never surface a member that escapes the container —
+        // an attacker-controlled `ldp:contains` entry must not pull the client
+        // to a foreign origin or outside the sub-tree.
         assertWithinBase(this.container, absolute, { allowRoot: true });
+        urls.push(absolute);
       } catch {
-        continue;
+        // Skip this one entry; keep processing the rest of the listing.
       }
-      urls.push(absolute);
     }
     urls.sort();
     return urls;
@@ -203,16 +321,19 @@ export class SolidUpdateStore {
     assertWithinBase(this.container, url);
     const res = await this.fetch(url, {
       method: "GET",
+      redirect: "manual",
       headers: { accept: UPDATE_CONTENT_TYPE },
     });
+    assertNotRedirected(res, url);
     if (res.status === 404 || res.status === 410) {
       return null;
     }
     if (!res.ok) {
       throw new Error(`[y-solid] readUpdate ${url} failed: ${res.status} ${res.statusText}`);
     }
-    const buf = await res.arrayBuffer();
-    return new Uint8Array(buf);
+    // Size-cap the read: never buffer an unbounded body from a hostile/buggy
+    // server into memory.
+    return readBodyCapped(res, this.maxUpdateBytes, url);
   }
 
   /**
@@ -240,7 +361,8 @@ export class SolidUpdateStore {
    */
   async deleteUpdate(url: string): Promise<void> {
     assertWithinBase(this.container, url);
-    const res = await this.fetch(url, { method: "DELETE" });
+    const res = await this.fetch(url, { method: "DELETE", redirect: "manual" });
+    assertNotRedirected(res, url);
     if (res.status === 404 || res.status === 410) {
       return;
     }
@@ -293,4 +415,13 @@ function toBody(update: Uint8Array): Uint8Array {
   const copy = new Uint8Array(update.byteLength);
   copy.set(update);
   return copy;
+}
+
+/**
+ * Resolve a caller-supplied byte cap: a finite positive number, else the
+ * default. Guards against `0`/negative/`NaN`/`Infinity` silently disabling the
+ * fail-closed cap.
+ */
+function clampPositive(value: number | undefined, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : fallback;
 }

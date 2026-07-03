@@ -97,6 +97,15 @@ export declare class SolidPersistence {
      */
     private load;
     /**
+     * Apply a batch of (untrusted) binary updates to the doc as ONE transaction
+     * with this provider as the origin (echo-free). Each `applyUpdate` is wrapped
+     * individually so a single malformed/hostile update is skipped and reported on
+     * the `"error"` event rather than corrupting the transaction or throwing out of
+     * the load/sync path. Yjs's own CRDT decode is the only trust boundary; we do
+     * not attempt to validate the bytes ourselves.
+     */
+    private applyStored;
+    /**
      * Pull updates appended to the pod SINCE the last load/sync and apply the new
      * ones — the manual hook a notifications channel or a poll loop calls to get
      * remote changes (the live-sync seam). Returns the number of new updates
