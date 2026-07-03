@@ -101,20 +101,26 @@ export declare class SolidPersistence {
      *
      * **Validate-on-scratch-first (load-bearing for data integrity).** Yjs
      * transactions have NO rollback: a malformed update that throws AFTER partially
-     * integrating structs would leave the LIVE doc silently corrupted while we
-     * "skip" it. So every untrusted update is FIRST replayed against a throwaway
-     * `Y.Doc` — a malformed/forged update throws THERE (corrupting only the
-     * scratch, which is discarded) and is skipped + reported on `"error"`, the live
-     * doc untouched. Only updates that apply cleanly to the scratch are then
-     * applied to the live doc, batched into ONE transaction with this provider as
-     * the origin (so a good batch stays atomic-ish and echo-free — no N-transaction
-     * fan-out, no re-persist).
+     * integrating structs would leave a doc silently corrupted, and the untrusted
+     * bytes are NEVER allowed to touch the LIVE doc directly. Two phases:
      *
-     * A validated update should never throw on the live doc (decoding is
-     * state-independent); if one somehow does, that is a GENUINE integration error
-     * — surfaced on `"error"`, never swallowed as a mere "skipped corrupt update".
+     *   1. **Decode-validate** each untrusted update on a throwaway `Y.Doc` — a
+     *      malformed/forged update throws HERE (corrupting only the discarded
+     *      throwaway) and is skipped + reported on `"error"`.
+     *   2. **Seed-scratch-then-diff.** Seed a scratch doc from the CURRENT live
+     *      state, replay the decode-validated updates onto the scratch, then take a
+     *      Yjs-generated DIFF of the scratch against the live state vector and apply
+     *      THAT diff to the live doc in one echo-free transaction. A Yjs-generated
+     *      diff is well-formed by construction, so it cannot throw mid-integration —
+     *      the live doc is thus only ever mutated by clean, complete Yjs bytes, and
+     *      is NEVER left partially mutated by untrusted input.
      *
-     * @returns the count actually applied to the live doc.
+     * If any scratch step throws (not expected — decode already succeeded), we FAIL
+     * CLOSED: the diff is computed and applied only after the scratch work fully
+     * succeeds, so on any throw the live doc is untouched and the batch is reported
+     * on `"error"` with `applied === 0`.
+     *
+     * @returns the count folded into the live doc (0 if the batch failed closed).
      */
     private applyStored;
     /**

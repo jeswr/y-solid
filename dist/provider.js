@@ -30,8 +30,12 @@
  * any update resources appended since the last load and applies the new ones.
  * See the README "Live sync" section. (Tracked as a follow-up.)
  */
-import { applyUpdate, Doc, encodeStateAsUpdate, mergeUpdates } from "yjs";
+import { applyUpdate, Doc, encodeStateAsUpdate, encodeStateVector, mergeUpdates } from "yjs";
 import { SolidUpdateStore } from "./store.js";
+/** Normalise an unknown throw value to an `Error`. */
+function toError(cause) {
+    return cause instanceof Error ? cause : new Error(String(cause));
+}
 /**
  * A Yjs persistence provider backed by a Solid pod update-log.
  *
@@ -113,57 +117,74 @@ export class SolidPersistence {
      *
      * **Validate-on-scratch-first (load-bearing for data integrity).** Yjs
      * transactions have NO rollback: a malformed update that throws AFTER partially
-     * integrating structs would leave the LIVE doc silently corrupted while we
-     * "skip" it. So every untrusted update is FIRST replayed against a throwaway
-     * `Y.Doc` — a malformed/forged update throws THERE (corrupting only the
-     * scratch, which is discarded) and is skipped + reported on `"error"`, the live
-     * doc untouched. Only updates that apply cleanly to the scratch are then
-     * applied to the live doc, batched into ONE transaction with this provider as
-     * the origin (so a good batch stays atomic-ish and echo-free — no N-transaction
-     * fan-out, no re-persist).
+     * integrating structs would leave a doc silently corrupted, and the untrusted
+     * bytes are NEVER allowed to touch the LIVE doc directly. Two phases:
      *
-     * A validated update should never throw on the live doc (decoding is
-     * state-independent); if one somehow does, that is a GENUINE integration error
-     * — surfaced on `"error"`, never swallowed as a mere "skipped corrupt update".
+     *   1. **Decode-validate** each untrusted update on a throwaway `Y.Doc` — a
+     *      malformed/forged update throws HERE (corrupting only the discarded
+     *      throwaway) and is skipped + reported on `"error"`.
+     *   2. **Seed-scratch-then-diff.** Seed a scratch doc from the CURRENT live
+     *      state, replay the decode-validated updates onto the scratch, then take a
+     *      Yjs-generated DIFF of the scratch against the live state vector and apply
+     *      THAT diff to the live doc in one echo-free transaction. A Yjs-generated
+     *      diff is well-formed by construction, so it cannot throw mid-integration —
+     *      the live doc is thus only ever mutated by clean, complete Yjs bytes, and
+     *      is NEVER left partially mutated by untrusted input.
      *
-     * @returns the count actually applied to the live doc.
+     * If any scratch step throws (not expected — decode already succeeded), we FAIL
+     * CLOSED: the diff is computed and applied only after the scratch work fully
+     * succeeds, so on any throw the live doc is untouched and the batch is reported
+     * on `"error"` with `applied === 0`.
+     *
+     * @returns the count folded into the live doc (0 if the batch failed closed).
      */
     applyStored(updates) {
         if (updates.length === 0)
             return 0;
         const errors = [];
-        // 1. Validate each untrusted update against a fresh scratch doc.
+        // Phase 1: decode-validate each untrusted update on a fresh throwaway doc.
         const valid = [];
         for (const update of updates) {
-            const scratch = new Doc();
+            const probe = new Doc();
             try {
-                applyUpdate(scratch, update);
+                applyUpdate(probe, update);
                 valid.push(update);
             }
             catch (cause) {
-                const error = cause instanceof Error ? cause : new Error(String(cause));
-                errors.push(new Error(`[y-solid] skipped a corrupt update: ${error.message}`));
+                errors.push(new Error(`[y-solid] skipped a corrupt update: ${toError(cause).message}`));
+            }
+            finally {
+                probe.destroy();
+            }
+        }
+        // Phase 2: fold the validated updates in via a Yjs-generated diff so the live
+        // doc is only ever mutated by well-formed, complete bytes (no partial-apply).
+        let applied = 0;
+        if (valid.length > 0) {
+            const scratch = new Doc();
+            try {
+                // Seed the scratch from the live state (so the diff is relative to it)...
+                applyUpdate(scratch, encodeStateAsUpdate(this.doc));
+                const liveVector = encodeStateVector(this.doc);
+                // ...replay the validated updates onto the scratch...
+                for (const update of valid)
+                    applyUpdate(scratch, update);
+                // ...and compute the net change as a Yjs-generated diff.
+                const diff = encodeStateAsUpdate(scratch, liveVector);
+                // Apply the clean diff to the live doc as one echo-free transaction.
+                this.doc.transact(() => {
+                    applyUpdate(this.doc, diff, this);
+                }, this);
+                applied = valid.length;
+            }
+            catch (cause) {
+                // A decode-validated update failed to integrate into the scratch — not
+                // expected. Fail closed: the live doc was NOT touched (the diff is applied
+                // only after the scratch work fully succeeds). Report, do not corrupt.
+                errors.push(new Error(`[y-solid] failed to integrate validated updates: ${toError(cause).message}`));
             }
             finally {
                 scratch.destroy();
-            }
-        }
-        // 2. Apply the validated updates to the LIVE doc as one echo-free transaction.
-        let applied = 0;
-        if (valid.length > 0) {
-            try {
-                this.doc.transact(() => {
-                    for (const update of valid) {
-                        applyUpdate(this.doc, update, this);
-                        applied++;
-                    }
-                }, this);
-            }
-            catch (cause) {
-                // A scratch-validated update threw on the live doc — genuinely
-                // unexpected. Surface it (do NOT swallow it as "skipped").
-                const error = cause instanceof Error ? cause : new Error(String(cause));
-                errors.push(new Error(`[y-solid] failed to integrate a validated update into the doc: ${error.message}`));
             }
         }
         // Emit AFTER the transaction commits so an error listener cannot reentrantly

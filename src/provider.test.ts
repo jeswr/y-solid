@@ -247,11 +247,14 @@ describe("SolidPersistence — corrupt-update resilience (untrusted pod bytes)",
 
     // The valid update applied...
     expect(doc.getText("t").toString()).toBe("ok");
-    // ...and the hazardous update left NO trace: the doc's state equals exactly a
-    // fresh doc with only the valid seed applied (byte-identical CRDT state).
+    // ...and the hazardous update left NO trace: the doc's FULL encoded state
+    // (structs AND pending/residual state — not just the state vector) is
+    // byte-identical to a fresh doc with only the valid seed applied.
     const expected = new Y.Doc();
     Y.applyUpdate(expected, Y.encodeStateAsUpdate(seed));
-    expect(Array.from(Y.encodeStateVector(doc))).toEqual(Array.from(Y.encodeStateVector(expected)));
+    expect(Array.from(Y.encodeStateAsUpdate(doc))).toEqual(
+      Array.from(Y.encodeStateAsUpdate(expected)),
+    );
     // The map key from the throwing update must NOT be present.
     expect(doc.getMap("m").get("k")).toBeUndefined();
     // It was reported, not fatal.
