@@ -19,11 +19,16 @@
  */
 
 export {
+  assertWithinPodScope,
+  isContainerUrl,
+  normalizePodBase,
+  PodScopeError,
+} from "@jeswr/guarded-fetch";
+export {
   SolidPersistence,
   type SolidPersistenceEvents,
   type SolidPersistenceOptions,
 } from "./provider.js";
-export { assertWithinBase, isContainerUrl, normalizeContainer } from "./scope.js";
 export {
   SolidUpdateStore,
   type SolidUpdateStoreOptions,

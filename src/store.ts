@@ -34,9 +34,11 @@
  * keeps it a pure LDP client, like `@jeswr/solid-memory`.
  *
  * **Scope guard on every op.** Every target URL is asserted to lie under
- * `container` (see {@link ./scope.js}) before any request — defence in depth, so
- * a caller-supplied or server-listed URL can never make the store touch a
- * foreign origin or escape the container sub-tree.
+ * `container` (via `@jeswr/guarded-fetch`'s `assertWithinPodScope`, the suite's
+ * consolidated pod-scope guard) before any request — defence in depth, so a
+ * caller-supplied or server-listed URL can never make the store touch a
+ * foreign origin or escape the container sub-tree. Write-target ops pass
+ * `{ allowRoot: false }`; the listing op passes `{ allowRoot: true }`.
  *
  * **RDF discipline (house rule).** The ONLY RDF the store touches is the
  * container LISTING, parsed (read-only) via `@jeswr/fetch-rdf` `parseRdf` +
@@ -46,9 +48,9 @@
  */
 
 import { parseRdf } from "@jeswr/fetch-rdf";
+import { assertWithinPodScope, isContainerUrl, normalizePodBase } from "@jeswr/guarded-fetch";
 import { ContainerDataset } from "@solid/object";
 import { DataFactory } from "n3";
-import { assertWithinBase, isContainerUrl, normalizeContainer } from "./scope.js";
 
 /** The media type every update resource is stored with. */
 export const UPDATE_CONTENT_TYPE = "application/octet-stream";
@@ -197,8 +199,8 @@ export class SolidUpdateStore {
   private readonly maxListingBytes: number;
 
   constructor(options: SolidUpdateStoreOptions) {
-    // normalizeContainer throws on a non-http(s) / non-absolute container.
-    this.container = normalizeContainer(options.container);
+    // normalizePodBase throws on a non-http(s) / non-absolute container.
+    this.container = normalizePodBase(options.container);
     this.fetch = options.fetch;
     this.maxUpdateBytes = clampPositive(options.maxUpdateBytes, DEFAULT_MAX_UPDATE_BYTES);
     this.maxListingBytes = clampPositive(options.maxListingBytes, DEFAULT_MAX_LISTING_BYTES);
@@ -214,8 +216,10 @@ export class SolidUpdateStore {
    */
   async appendUpdate(update: Uint8Array): Promise<{ url: string }> {
     const url = `${this.container}${mintUpdateName()}`;
-    // Defence in depth: a minted URL is always under the container, but assert it.
-    assertWithinBase(this.container, url);
+    // Defence in depth: a minted URL is always under the container, but assert
+    // it. Write-target semantics: the container root is never a managed
+    // resource (allowRoot: false).
+    assertWithinPodScope(this.container, url, { allowRoot: false });
     const res = await this.fetch(url, {
       method: "PUT",
       redirect: "manual",
@@ -300,7 +304,7 @@ export class SolidUpdateStore {
         // Defence in depth: never surface a member that escapes the container —
         // an attacker-controlled `ldp:contains` entry must not pull the client
         // to a foreign origin or outside the sub-tree.
-        assertWithinBase(this.container, absolute, { allowRoot: true });
+        assertWithinPodScope(this.container, absolute, { allowRoot: true });
         urls.push(absolute);
       } catch {
         // Skip this one entry; keep processing the rest of the listing.
@@ -318,7 +322,7 @@ export class SolidUpdateStore {
    *   non-404/410 response.
    */
   async readUpdate(url: string): Promise<Uint8Array | null> {
-    assertWithinBase(this.container, url);
+    assertWithinPodScope(this.container, url, { allowRoot: false });
     const res = await this.fetch(url, {
       method: "GET",
       redirect: "manual",
@@ -360,7 +364,7 @@ export class SolidUpdateStore {
    *   response.
    */
   async deleteUpdate(url: string): Promise<void> {
-    assertWithinBase(this.container, url);
+    assertWithinPodScope(this.container, url, { allowRoot: false });
     const res = await this.fetch(url, { method: "DELETE", redirect: "manual" });
     assertNotRedirected(res, url);
     if (res.status === 404 || res.status === 410) {
@@ -393,7 +397,7 @@ export class SolidUpdateStore {
     // Guard the to-be-deleted URLs up front (fail before writing anything if any
     // is out of scope).
     for (const url of obsoleteUrls) {
-      assertWithinBase(this.container, url);
+      assertWithinPodScope(this.container, url, { allowRoot: false });
     }
     const created = await this.appendUpdate(merged);
     for (const url of obsoleteUrls) {
