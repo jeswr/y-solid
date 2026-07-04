@@ -1,6 +1,7 @@
 // AUTHORED-BY Claude Opus 4.8 (Fable unavailable) — re-review/upgrade candidate.
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { assertWithinPodScope } from "@jeswr/guarded-fetch";
 import { describe, expect, it } from "vitest";
 import { SolidUpdateStore, UPDATE_CONTENT_TYPE } from "./store.js";
 import { makePod } from "./testPod.js";
@@ -70,18 +71,76 @@ describe("the scope guard is enforced on every op", () => {
   it("rejects reading/deleting a foreign-origin URL", async () => {
     const { store } = makeStore();
     await expect(store.readUpdate("https://evil.example/notes/my-doc/u")).rejects.toThrow(
-      /escapes container origin/,
+      /escapes pod origin/,
     );
     await expect(store.deleteUpdate("https://evil.example/notes/my-doc/u")).rejects.toThrow(
-      /escapes container origin/,
+      /escapes pod origin/,
     );
   });
 
   it("rejects an escaping sibling path", async () => {
     const { store } = makeStore();
     await expect(store.readUpdate("https://alice.pod/notes/other/u")).rejects.toThrow(
-      /escapes container path/,
+      /escapes pod path/,
     );
+  });
+
+  it(
+    "rejects a path-prefix-sibling escape (segment-boundary regression) even when the " +
+      "caller passes a NON-normalised (no trailing slash) container directly to the guard",
+    () => {
+      // The bespoke `assertWithinBase` this store previously used did a bare
+      // `pathname.startsWith(basePath)` on WHATEVER `container` string the
+      // caller passed to it — internal store call sites always normalised
+      // first, so the store itself was safe, but the guard's own public
+      // contract was NOT: a raw, non-slash-terminated container let a sibling
+      // like `/notes/my-doc-evil/` slip through `startsWith("/notes/my-doc")`.
+      // `assertWithinPodScope` closes this structurally — it normalises the
+      // base internally on every call, regardless of what the caller passes.
+      const rawContainer = "https://alice.pod/notes/my-doc"; // NOTE: no trailing slash
+      expect(() =>
+        assertWithinPodScope(rawContainer, "https://alice.pod/notes/my-doc-evil/u", {
+          allowRoot: false,
+        }),
+      ).toThrow(/escapes pod path/);
+      // The true descendant still passes.
+      expect(() =>
+        assertWithinPodScope(rawContainer, "https://alice.pod/notes/my-doc/u", {
+          allowRoot: false,
+        }),
+      ).not.toThrow();
+    },
+  );
+
+  it("operates on the CANONICAL scoped URL, not the raw input (check-then-use-the-checked-value)", async () => {
+    // A non-canonical but in-scope input URL (a `sub/..` dot-segment that the
+    // WHATWG parser collapses back into the container) must be dereferenced at
+    // its CANONICAL form — the URL the guard validated — NOT the raw string.
+    // The fake pod keys its store by the exact URL passed to fetch, so a read
+    // that hit the raw (uncollapsed) string would 404 (return null); a read
+    // that hit the canonical URL returns the stored bytes. This is the
+    // regression for the roborev HIGH: assertWithinPodScope returns the
+    // canonical URL and the op must fetch THAT.
+    const { pod, store } = makeStore();
+    const canonical = `${CONTAINER}update-x`;
+    const nonCanonical = `${CONTAINER}sub/../update-x`; // collapses to `canonical`
+    // Sanity: the raw and canonical strings genuinely differ.
+    expect(nonCanonical).not.toBe(canonical);
+    pod.store.set(canonical, {
+      body: new Uint8Array([7, 8, 9]),
+      contentType: UPDATE_CONTENT_TYPE,
+      etag: '"seed"',
+    });
+
+    // READ via the non-canonical URL → must hit the canonical resource.
+    const read = await store.readUpdate(nonCanonical);
+    expect(read).not.toBeNull();
+    expect(Array.from(read as Uint8Array)).toEqual([7, 8, 9]);
+
+    // DELETE via the non-canonical URL → must remove the canonical resource.
+    expect(pod.store.has(canonical)).toBe(true);
+    await store.deleteUpdate(nonCanonical);
+    expect(pod.store.has(canonical)).toBe(false);
   });
 });
 
@@ -159,7 +218,7 @@ describe("compact — write-before-delete", () => {
     const before = pod.calls.putCount;
     await expect(
       store.compact(new Uint8Array([1]), ["https://evil.example/notes/my-doc/u"]),
-    ).rejects.toThrow(/escapes container origin/);
+    ).rejects.toThrow(/escapes pod origin/);
     // No write happened (the guard fired before appendUpdate).
     expect(pod.calls.putCount).toBe(before);
   });

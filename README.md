@@ -83,13 +83,15 @@ an RDF encoding for them. The only RDF it touches is the LDP **container listing
 ## Security: a fail-closed scope guard
 
 Every URL the provider reads, writes, or deletes is asserted to lie **under the configured
-container** before any request (`assertWithinBase` — same-origin, path-prefixed, and the
-container root itself rejected for resource ops). A hostile or buggy server that lists a
-foreign-origin or path-escaping member can never make the provider touch it: such members
-are skipped on read and rejected on write. The container is the one security boundary, and
-the guard is applied as defence-in-depth on *every* operation (including each minted write
-target). The auth seam is strict: `y-solid` performs **no** crypto/DPoP and imports **no**
-concrete auth library — you inject an already-authenticated `fetch`.
+container** before any request, via [`@jeswr/guarded-fetch`](https://github.com/jeswr/guarded-fetch)'s
+consolidated pod-scope guard (`assertWithinPodScope` — same-origin, segment-boundary
+path-prefixed, and the container root itself rejected for resource ops via `{ allowRoot: false }`).
+A hostile or buggy server that lists a foreign-origin or path-escaping member can never make the
+provider touch it: such members are skipped on read and rejected on write. The container is the
+one security boundary, and the guard is applied as defence-in-depth on *every* operation
+(including each minted write target). The auth seam is strict: `y-solid` performs **no**
+crypto/DPoP and imports **no** concrete auth library — you inject an already-authenticated
+`fetch`.
 
 ## Live cross-client sync — a documented seam (follow-up, not built here)
 
@@ -142,9 +144,10 @@ Properties / methods:
 The lower-level persistence store, if you want to manage the update log yourself:
 `appendUpdate`, `readUpdate`, `listUpdateUrls`, `loadUpdates`, `deleteUpdate`, `compact`.
 
-### Scope helpers (`@jeswr/y-solid/scope`)
+### Scope helpers (re-exported from `@jeswr/guarded-fetch`)
 
-`normalizeContainer`, `assertWithinBase`, `isContainerUrl` — the fail-closed scope guard.
+`normalizePodBase`, `assertWithinPodScope`, `isContainerUrl`, `PodScopeError` — the fail-closed
+pod-scope guard every store operation runs through.
 
 ## Development
 

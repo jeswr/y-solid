@@ -33,9 +33,11 @@
  * keeps it a pure LDP client, like `@jeswr/solid-memory`.
  *
  * **Scope guard on every op.** Every target URL is asserted to lie under
- * `container` (see {@link ./scope.js}) before any request — defence in depth, so
- * a caller-supplied or server-listed URL can never make the store touch a
- * foreign origin or escape the container sub-tree.
+ * `container` (via `@jeswr/guarded-fetch`'s `assertWithinPodScope`, the suite's
+ * consolidated pod-scope guard) before any request — defence in depth, so a
+ * caller-supplied or server-listed URL can never make the store touch a
+ * foreign origin or escape the container sub-tree. Write-target ops pass
+ * `{ allowRoot: false }`; the listing op passes `{ allowRoot: true }`.
  *
  * **RDF discipline (house rule).** The ONLY RDF the store touches is the
  * container LISTING, parsed (read-only) via `@jeswr/fetch-rdf` `parseRdf` +

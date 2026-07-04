@@ -16,7 +16,7 @@
  *
  * @packageDocumentation
  */
+export { assertWithinPodScope, isContainerUrl, normalizePodBase, PodScopeError, } from "@jeswr/guarded-fetch";
 export { SolidPersistence, type SolidPersistenceEvents, type SolidPersistenceOptions, } from "./provider.js";
-export { assertWithinBase, isContainerUrl, normalizeContainer } from "./scope.js";
 export { SolidUpdateStore, type SolidUpdateStoreOptions, type StoredUpdate, UPDATE_CONTENT_TYPE, } from "./store.js";
 //# sourceMappingURL=index.d.ts.map
