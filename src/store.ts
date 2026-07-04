@@ -215,11 +215,13 @@ export class SolidUpdateStore {
    * @throws if the write is rejected (incl. a 412 collision).
    */
   async appendUpdate(update: Uint8Array): Promise<{ url: string }> {
-    const url = `${this.container}${mintUpdateName()}`;
+    const minted = `${this.container}${mintUpdateName()}`;
     // Defence in depth: a minted URL is always under the container, but assert
     // it. Write-target semantics: the container root is never a managed
-    // resource (allowRoot: false).
-    assertWithinPodScope(this.container, url, { allowRoot: false });
+    // resource (allowRoot: false). Use the CANONICAL URL the guard returns
+    // (check-then-use-the-checked-value) so the URL written + returned is the
+    // URL that was validated.
+    const url = assertWithinPodScope(this.container, minted, { allowRoot: false });
     const res = await this.fetch(url, {
       method: "PUT",
       redirect: "manual",
@@ -322,22 +324,25 @@ export class SolidUpdateStore {
    *   non-404/410 response.
    */
   async readUpdate(url: string): Promise<Uint8Array | null> {
-    assertWithinPodScope(this.container, url, { allowRoot: false });
-    const res = await this.fetch(url, {
+    // Check-then-USE-the-checked-value: assertWithinPodScope returns the
+    // CANONICAL (WHATWG-normalised) in-scope URL; fetch THAT, never the raw
+    // input, so the URL that was validated is the URL that is dereferenced.
+    const scoped = assertWithinPodScope(this.container, url, { allowRoot: false });
+    const res = await this.fetch(scoped, {
       method: "GET",
       redirect: "manual",
       headers: { accept: UPDATE_CONTENT_TYPE },
     });
-    assertNotRedirected(res, url);
+    assertNotRedirected(res, scoped);
     if (res.status === 404 || res.status === 410) {
       return null;
     }
     if (!res.ok) {
-      throw new Error(`[y-solid] readUpdate ${url} failed: ${res.status} ${res.statusText}`);
+      throw new Error(`[y-solid] readUpdate ${scoped} failed: ${res.status} ${res.statusText}`);
     }
     // Size-cap the read: never buffer an unbounded body from a hostile/buggy
     // server into memory.
-    return readBodyCapped(res, this.maxUpdateBytes, url);
+    return readBodyCapped(res, this.maxUpdateBytes, scoped);
   }
 
   /**
@@ -364,14 +369,16 @@ export class SolidUpdateStore {
    *   response.
    */
   async deleteUpdate(url: string): Promise<void> {
-    assertWithinPodScope(this.container, url, { allowRoot: false });
-    const res = await this.fetch(url, { method: "DELETE", redirect: "manual" });
-    assertNotRedirected(res, url);
+    // Check-then-USE-the-checked-value: DELETE the CANONICAL in-scope URL the
+    // guard returned, never the raw input.
+    const scoped = assertWithinPodScope(this.container, url, { allowRoot: false });
+    const res = await this.fetch(scoped, { method: "DELETE", redirect: "manual" });
+    assertNotRedirected(res, scoped);
     if (res.status === 404 || res.status === 410) {
       return;
     }
     if (!res.ok) {
-      throw new Error(`[y-solid] deleteUpdate ${url} failed: ${res.status} ${res.statusText}`);
+      throw new Error(`[y-solid] deleteUpdate ${scoped} failed: ${res.status} ${res.statusText}`);
     }
   }
 
@@ -395,16 +402,19 @@ export class SolidUpdateStore {
    */
   async compact(merged: Uint8Array, obsoleteUrls: readonly string[]): Promise<{ url: string }> {
     // Guard the to-be-deleted URLs up front (fail before writing anything if any
-    // is out of scope).
-    for (const url of obsoleteUrls) {
-      assertWithinPodScope(this.container, url, { allowRoot: false });
-    }
+    // is out of scope), capturing the CANONICAL in-scope form the guard returns
+    // so the subsequent DELETE + self-write comparison operate on the checked
+    // value, not the raw input (check-then-use-the-checked-value).
+    const scopedObsolete = obsoleteUrls.map((url) =>
+      assertWithinPodScope(this.container, url, { allowRoot: false }),
+    );
     const created = await this.appendUpdate(merged);
-    for (const url of obsoleteUrls) {
+    for (const scoped of scopedObsolete) {
       // Never delete the resource we just wrote (a minted name cannot collide
-      // with an existing one, but guard against a caller passing it back).
-      if (url === created.url) continue;
-      await this.deleteUpdate(url);
+      // with an existing one, but guard against a caller passing it back). Both
+      // sides are canonical here, so the comparison is exact.
+      if (scoped === created.url) continue;
+      await this.deleteUpdate(scoped);
     }
     return created;
   }

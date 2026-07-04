@@ -111,6 +111,37 @@ describe("the scope guard is enforced on every op", () => {
       ).not.toThrow();
     },
   );
+
+  it("operates on the CANONICAL scoped URL, not the raw input (check-then-use-the-checked-value)", async () => {
+    // A non-canonical but in-scope input URL (a `sub/..` dot-segment that the
+    // WHATWG parser collapses back into the container) must be dereferenced at
+    // its CANONICAL form — the URL the guard validated — NOT the raw string.
+    // The fake pod keys its store by the exact URL passed to fetch, so a read
+    // that hit the raw (uncollapsed) string would 404 (return null); a read
+    // that hit the canonical URL returns the stored bytes. This is the
+    // regression for the roborev HIGH: assertWithinPodScope returns the
+    // canonical URL and the op must fetch THAT.
+    const { pod, store } = makeStore();
+    const canonical = `${CONTAINER}update-x`;
+    const nonCanonical = `${CONTAINER}sub/../update-x`; // collapses to `canonical`
+    // Sanity: the raw and canonical strings genuinely differ.
+    expect(nonCanonical).not.toBe(canonical);
+    pod.store.set(canonical, {
+      body: new Uint8Array([7, 8, 9]),
+      contentType: UPDATE_CONTENT_TYPE,
+      etag: '"seed"',
+    });
+
+    // READ via the non-canonical URL → must hit the canonical resource.
+    const read = await store.readUpdate(nonCanonical);
+    expect(read).not.toBeNull();
+    expect(Array.from(read as Uint8Array)).toEqual([7, 8, 9]);
+
+    // DELETE via the non-canonical URL → must remove the canonical resource.
+    expect(pod.store.has(canonical)).toBe(true);
+    await store.deleteUpdate(nonCanonical);
+    expect(pod.store.has(canonical)).toBe(false);
+  });
 });
 
 describe("listUpdateUrls + loadUpdates — append-log ordering", () => {
